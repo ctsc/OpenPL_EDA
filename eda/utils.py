@@ -9,7 +9,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
-def load_all_meets(base_path="opl-data/meet-data", max_federations=None, chunk_size=100):
+def load_all_meets(base_path="opl-data/meet-data", max_federations=None, chunk_size=100, date_range=None):
     """
     Recursively load all entries.csv and meet.csv files from the meet-data directory.
     Uses chunked processing to avoid memory issues.
@@ -18,6 +18,9 @@ def load_all_meets(base_path="opl-data/meet-data", max_federations=None, chunk_s
         base_path: Path to meet-data directory
         max_federations: Limit number of federations to load (None = all)
         chunk_size: Number of dataframes to accumulate before concatenating
+        date_range: Tuple of (start_date, end_date) as strings or Timestamps.
+                   If None, loads all dates.
+                   Example: date_range=('2015-01-01', '2025-12-31')
     
     Returns:
         entries_df: Combined entries dataframe
@@ -26,6 +29,14 @@ def load_all_meets(base_path="opl-data/meet-data", max_federations=None, chunk_s
     base_path = Path(base_path)
     entries_list = []
     meets_list = []
+    
+    # Parse date_range if provided
+    start_date = None
+    end_date = None
+    if date_range is not None:
+        start_date = pd.Timestamp(date_range[0])
+        end_date = pd.Timestamp(date_range[1])
+        print(f"Date filter enabled: {start_date.date()} to {end_date.date()}")
     
     # Get all federation directories
     fed_dirs = [d for d in base_path.iterdir() if d.is_dir() and not d.name.startswith('.')]
@@ -37,44 +48,108 @@ def load_all_meets(base_path="opl-data/meet-data", max_federations=None, chunk_s
     else:
         print(f"Found {len(fed_dirs)} federation directories")
     
-    total_entries = 0
+    # FIRST PASS: Load all meets and filter by date if date_range is provided
+    filtered_meet_paths = set()
     total_meets = 0
+    meets_in_range = 0
     
-    for fed_dir in tqdm(fed_dirs, desc="Loading federations"):
-        federation = fed_dir.name
+    if date_range is not None:
+        print("\n" + "="*80)
+        print("PASS 1: Loading meets and filtering by date range...")
+        print("="*80)
         
-        # Get all meet directories
+        for fed_dir in tqdm(fed_dirs, desc="Loading meets (pass 1)"):
+            federation = fed_dir.name
+            meet_dirs = [d for d in fed_dir.iterdir() if d.is_dir()]
+            
+            for meet_dir in meet_dirs:
+                meet_file = meet_dir / "meet.csv"
+                
+                if meet_file.exists():
+                    try:
+                        meet_df = pd.read_csv(meet_file, low_memory=False)
+                        meet_path = f"{federation}/{meet_dir.name}"
+                        total_meets += 1
+                        
+                        # Check date if Date column exists
+                        # meet.csv typically has one row, but handle multiple rows
+                        if 'Date' in meet_df.columns:
+                            # Get the first valid date (meets usually have one date)
+                            meet_date = pd.to_datetime(meet_df['Date'].iloc[0] if len(meet_df) > 0 else None, errors='coerce')
+                            
+                            if pd.notna(meet_date):
+                                # Check if date is within range
+                                if start_date <= meet_date <= end_date:
+                                    filtered_meet_paths.add(meet_path)
+                                    meets_in_range += 1
+                                    # Add to meets_list
+                                    meet_df['MeetPath'] = meet_path
+                                    meets_list.append(meet_df)
+                            # If date is invalid/NaN, exclude the meet (strict filtering)
+                        else:
+                            # No date column - exclude it (strict filtering - only include meets with valid dates)
+                            pass
+                    except Exception as e:
+                        # Silently skip problematic files
+                        continue
+        
+        print(f"\n✓ Pass 1 complete:")
+        print(f"  Total meets found: {total_meets:,}")
+        print(f"  Meets in date range ({start_date.date()} to {end_date.date()}): {meets_in_range:,}")
+        print(f"  Meets filtered out: {total_meets - meets_in_range:,}")
+        
+    else:
+        # No date filter - load all meets normally
+        print("\nLoading all meets (no date filter)...")
+        for fed_dir in tqdm(fed_dirs, desc="Loading meets"):
+            federation = fed_dir.name
+            meet_dirs = [d for d in fed_dir.iterdir() if d.is_dir()]
+            
+            for meet_dir in meet_dirs:
+                meet_file = meet_dir / "meet.csv"
+                
+                if meet_file.exists():
+                    try:
+                        meet_df = pd.read_csv(meet_file, low_memory=False)
+                        meet_path = f"{federation}/{meet_dir.name}"
+                        meet_df['MeetPath'] = meet_path
+                        meets_list.append(meet_df)
+                        total_meets += 1
+                        filtered_meet_paths.add(meet_path)  # Include all if no filter
+                    except Exception as e:
+                        continue
+    
+    # SECOND PASS: Load entries only for filtered meets
+    print("\n" + "="*80)
+    print("PASS 2: Loading entries for filtered meets...")
+    print("="*80)
+    
+    total_entries = 0
+    entries_loaded = 0
+    
+    for fed_dir in tqdm(fed_dirs, desc="Loading entries (pass 2)"):
+        federation = fed_dir.name
         meet_dirs = [d for d in fed_dir.iterdir() if d.is_dir()]
         
         for meet_dir in meet_dirs:
             entries_file = meet_dir / "entries.csv"
-            meet_file = meet_dir / "meet.csv"
+            meet_path = f"{federation}/{meet_dir.name}"
             
-            # Load entries if exists
-            if entries_file.exists():
+            # Only load entries if meet is in filtered set
+            if meet_path in filtered_meet_paths and entries_file.exists():
                 try:
                     entries_df = pd.read_csv(entries_file, low_memory=False)
+                    total_entries += len(entries_df)
+                    
                     # Add metadata
                     entries_df['Federation'] = federation
-                    entries_df['MeetPath'] = f"{federation}/{meet_dir.name}"
+                    entries_df['MeetPath'] = meet_path
                     entries_list.append(entries_df)
-                    total_entries += len(entries_df)
+                    entries_loaded += len(entries_df)
                     
                     # Chunked concatenation to save memory
                     if len(entries_list) >= chunk_size:
                         entries_list = [pd.concat(entries_list, ignore_index=True)]
-                except Exception as e:
-                    # Silently skip problematic files
-                    continue
-            
-            # Load meet info if exists
-            if meet_file.exists():
-                try:
-                    meet_df = pd.read_csv(meet_file, low_memory=False)
-                    # Add metadata
-                    meet_df['MeetPath'] = f"{federation}/{meet_dir.name}"
-                    meets_list.append(meet_df)
-                    total_meets += 1
                 except Exception as e:
                     # Silently skip problematic files
                     continue
@@ -83,7 +158,9 @@ def load_all_meets(base_path="opl-data/meet-data", max_federations=None, chunk_s
     print(f"\nCombining {len(entries_list)} entry chunks...")
     if entries_list:
         entries_combined = pd.concat(entries_list, ignore_index=True)
-        print(f"✓ Loaded {len(entries_combined):,} entries from {total_entries:,} total rows")
+        print(f"✓ Loaded {len(entries_combined):,} entries from {entries_loaded:,} total rows")
+        if date_range is not None:
+            print(f"  (Only entries for meets in date range {start_date.date()} to {end_date.date()})")
     else:
         entries_combined = pd.DataFrame()
         print("⚠ No entries found")
@@ -92,6 +169,8 @@ def load_all_meets(base_path="opl-data/meet-data", max_federations=None, chunk_s
     if meets_list:
         meets_combined = pd.concat(meets_list, ignore_index=True)
         print(f"✓ Loaded {len(meets_combined):,} meets")
+        if date_range is not None:
+            print(f"  (Only meets in date range {start_date.date()} to {end_date.date()})")
     else:
         meets_combined = pd.DataFrame()
         print("⚠ No meets found")
@@ -283,7 +362,7 @@ def create_quality_filter(df):
     Filters out:
     - Failed meets (TotalKg < 50kg)
     - Extreme totals (>2000kg)
-    - Extreme bodyweights (<30kg or >200kg)
+    - Extreme bodyweights (<30kg or >150kg)
     - Retired lifters (4+ years since last meet)
     - Missing critical data (Name, Sex, IPF_WeightClass, TotalKg, Division)
     
@@ -309,7 +388,7 @@ def create_quality_filter(df):
         ~df['FailedMeet'] &  # Not bombed out
         (df['TotalKg'] <= 2000) &  # Not extreme high total
         (df['TotalKg'] >= 50) &  # Not extreme low total (explicit check)
-        (df['BodyweightKg'] >= 30) & (df['BodyweightKg'] <= 200) &  # Normal bodyweight
+        (df['BodyweightKg'] >= 30) & (df['BodyweightKg'] <= 150) &  # Normal bodyweight
         ~df['Retired'] &  # Not retired
         df['Name'].notna() &  # Has name
         df['Sex'].isin(['M', 'F']) &  # Valid gender
@@ -522,100 +601,44 @@ def categorize_lifters(df):
 
 def categorize_federation_testing_status(df):
     """
-    Categorize federations as 'Drug Tested' (fully tested OR mixed) vs 'Untested'.
+    Categorize federations as 'Drug Tested' vs 'Untested' based on Tested column.
     
     Logic:
-    1. Federations in the fully tested list (from is_fully_tested) are Drug Tested
-    2. Federations with ANY entries where Tested='Yes' are considered Mixed -> Drug Tested
-    3. All other federations are Untested
+    1. Special federations (IPL, EPF, EPA, THSWPA, THSPA, USAPL): Always "Drug Tested"
+    2. If Tested column is 'Yes' or 'yes' (case-insensitive): "Drug Tested"
+    3. For other federations: If Tested is empty/not "Yes", mark as "Untested"
     
     Args:
-        df: DataFrame with 'Federation', 'Tested', and 'Date' columns
+        df: DataFrame with 'Federation' and 'Tested' columns
         
     Returns:
         DataFrame with 'FederationTestingStatus' column added
     """
     df = df.copy()
     
-    # Fully tested federations (from is_fully_tested function in Rust code)
-    # Extracted from opl-data/crates/opltypes/src/federation.rs
-    FULLY_TESTED_FEDERATIONS = {
-        'AAPLF', 'ADAU', 'ADFPA', 'ADFPF', 'AEP', 'AfricanPF', 'AIWBPA', 'AMP',
-        'APLA', 'APPortugal', 'APU', 'APUA', 'AsianPF', 'AusDFPF', 'BahamasPF',
-        'BAWLA', 'BDFPA', 'BDFPF', 'BelPF', 'BP', 'BPA', 'BulgarianPF', 'BVDG',
-        'BVDK', 'CBLB', 'CHNPL', 'CNFA', 'ColPF', 'CommonwealthPF', 'CPU',
-        'CSST', 'CTPA', 'CyprusPF', 'DFPFNL', 'DSF', 'EgyptPF', 'EJTL', 'EPA',
-        'EPF', 'FALPO', 'FAPL', 'FCLP', 'FCP', 'FDNLP', 'FECAPOLIF', 'FECHIPO',
-        'Fedepotencia', 'FEFICULP', 'FELIPOME', 'FEMEPO', 'FESUPO', 'FEVEPO',
-        'FFForce', 'FFHMFAC', 'FHSAA', 'FIAP', 'FIPL', 'FMPB', 'FPP', 'FPPR',
-        'FPR', 'FRPL', 'FSFA', 'FULP', 'GAPLF', 'GDFPF', 'HKPF', 'HKWPA', 'HPF',
-        'HPLS', 'HTPL', 'Hunpower', 'IBSA', 'IDFPA', 'IDFPF', 'IHSPLA', 'IPF',
-        'IPFChina', 'IranBBF', 'IraqPF', 'IrishPF', 'IronBoy', 'JPA', 'KBGV',
-        'KDKS', 'KNKFSP', 'KPF', 'KRAFT', 'KPC', 'LebanonPF', 'LFPH', 'LibyaPF',
-        'LJTF', 'LPF', 'MaltaPA', 'ManxPL', 'MAP', 'MDFPA', 'MDFPF', 'MUPF',
-        'NAPF', 'NASA', 'NaturalPA', 'NauruPF', 'NIPF', 'NORCAL', 'NordicPF',
-        'NPAJ', 'NPB', 'NSF', 'NYFC', 'NZPF', 'NZAWLA', 'OceaniaPF', 'OCWP',
-        'ORPF', 'OEVK', 'PA', 'PAP', 'PFBD', 'PI', 'PLRD', 'PLSS', 'PLZS',
-        'PNGPF', 'POSK', 'PS', 'PWFL', 'PZKFiTS', 'QatarPL', 'RAW', 'RAWCAN',
-        'RAWUKR', 'RDFPF', 'SADFPA', 'SAFKST', 'SAFP', 'SAPF', 'ScottishPL',
-        'SDFPF', 'SLPF', 'SSAU', 'SSF', 'SSSC', 'SVNL', 'TAAP', 'ThaiPF',
-        'THSPA', 'THSWPA', 'TPSSF', 'TTPF', 'UAEPL', 'UDFPF', 'UgandaPF',
-        'UkrainePF', 'USABA', 'USAPL', 'USVIPF', 'VDFPA', 'VGPF', 'VPF',
-        'WABDL', 'WDFPF', 'WelshPA', 'WNPF', 'WP', 'WPChina', 'WPIndia',
-        'WPNauru', 'WPNiue', 'WPLanka', 'WPUSA', 'WPNZ', 'WPPO'
-    }
-    
-    # Date-dependent federations
-    # AAU: tested after 1995
-    # ILPF: tested after 2023
-    # RawIronPL: tested before 2020-06-20
-    DATE_DEPENDENT_FULLY_TESTED = {
-        'AAU': {'after_year': 1995},
-        'ILPF': {'after_year': 2023},
-        'RawIronPL': {'before_date': '2020-06-20'},
-    }
-    
-    # Convert Tested to boolean
-    df['IsTested'] = (df['Tested'] == 'Yes') | (df['Tested'] == 'yes')
-    
-    # Check if federation has any tested entries (mixed)
-    fed_has_tested = df.groupby('Federation')['IsTested'].any()
+    # Special federations that are always tested
+    ALWAYS_TESTED_FEDERATIONS = {'IPL', 'EPF', 'EPA', 'THSWPA', 'THSPA', 'USAPL'}
     
     # Categorize each entry
     def get_testing_status(row):
-        federation = row['Federation']
+        federation = row.get('Federation', None)
+        tested_value = row.get('Tested', None)
+        
+        # Handle missing federation
         if pd.isna(federation):
-            return 'Unknown'
+            return 'Untested'
         
-        # Check date-dependent cases
-        if federation in DATE_DEPENDENT_FULLY_TESTED:
-            rules = DATE_DEPENDENT_FULLY_TESTED[federation]
-            # Try Date column first, then MeetDate
-            date_col = 'Date' if 'Date' in row.index else 'MeetDate'
-            if date_col in row.index and pd.notna(row[date_col]):
-                try:
-                    meet_date = pd.to_datetime(row[date_col])
-                    
-                    if 'after_year' in rules:
-                        if meet_date.year >= rules['after_year']:
-                            return 'Drug Tested'
-                    elif 'before_date' in rules:
-                        from datetime import datetime
-                        cutoff = datetime.strptime(rules['before_date'], '%Y-%m-%d')
-                        if meet_date < cutoff:
-                            return 'Drug Tested'
-                except:
-                    pass
-        
-        # Check if in fully tested list
-        if federation in FULLY_TESTED_FEDERATIONS:
+        # Special federations are always tested
+        if federation in ALWAYS_TESTED_FEDERATIONS:
             return 'Drug Tested'
         
-        # Check if federation has any tested entries (mixed)
-        if fed_has_tested.get(federation, False):
-            return 'Drug Tested'
+        # Check Tested column (case-insensitive)
+        if pd.notna(tested_value):
+            tested_str = str(tested_value).strip()
+            if tested_str.lower() == 'yes':
+                return 'Drug Tested'
         
-        # Otherwise untested
+        # Default to untested
         return 'Untested'
     
     df['FederationTestingStatus'] = df.apply(get_testing_status, axis=1)
