@@ -1,6 +1,6 @@
 # OpenPL Total Prediction
 
-OpenPL Total Prediction is a technical notebook project that builds per-lift regression models to predict next-meet totals (squat, bench, deadlift) from historical meet data. It implements a full pipeline: multi-federation data ingestion, feature engineering, train/validation splits, GPU-accelerated XGBoost training with early stopping, and metric reporting (MAE/RMSE/R²).
+OpenPL Total Prediction is a Time-Series regression model within a Jupyter notebook project that builds per-lift regression models to predict next-meet totals (squat, bench, deadlift) from historical meet data. It implements a full pipeline: multi-federation data ingestion, feature engineering, train/validation splits, GPU-accelerated XGBoost training with early stopping, and metric reporting (MAE/RMSE/R²).
 
 ## Technical Overview
 - Ingestion: loads `entries.csv` and `meet.csv` across federations, concatenates, and merges on `MeetID`.
